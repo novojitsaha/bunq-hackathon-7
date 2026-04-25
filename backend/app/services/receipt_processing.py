@@ -87,15 +87,94 @@ async def apply_extraction(session: Session, receipt: Receipt, extracted: Extrac
 def confirm_receipt(session: Session, receipt: Receipt) -> Receipt:
     receipt.status = ReceiptStatus.CONFIRMED
     receipt.updated_at = utc_now()
+
+    # 1. Try the existing matching path first — if the user has a bunq
+    #    transaction that already corresponds to this receipt (e.g. they
+    #    actually paid with bunq), link them.
     transaction = best_transaction_match(session, receipt)
+
+    # 2. If no match, create a real bunq sandbox payment so the receipt
+    #    actually shows up in the bunq account. This is the important
+    #    fix for the "I scanned a receipt but bunq doesn't see it" case.
+    if transaction is None and receipt.total_amount and receipt.total_amount > 0:
+        transaction = _record_receipt_as_bunq_payment(session, receipt)
+
     if transaction and transaction.id:
         receipt.linked_transaction_id = transaction.id
         transaction.matched_receipt_id = receipt.id
         session.add(transaction)
+
     session.add(receipt)
     session.commit()
     session.refresh(receipt)
     return receipt
+
+
+def _record_receipt_as_bunq_payment(session: Session, receipt: Receipt) -> Transaction | None:
+    """
+    Send a real bunq sandbox Payment for this receipt's total to
+    sugardaddy@bunq.com so it appears in the user's bunq account, then mirror
+    it as a local Transaction record.
+
+    Falls back gracefully (returns None) if bunq is unreachable, the account
+    is unfunded, or any other error occurs — the receipt still confirms,
+    we just don't get a bunq transaction for it.
+    """
+    from app.config import get_settings
+    from app.models import MerchantCategory, TransactionDirection
+    from app.services.bunq_client import BunqSandboxError, get_bunq_client
+    from app.services.transaction_matcher import classify_merchant
+    import logging
+
+    log = logging.getLogger(__name__)
+    settings = get_settings()
+    if settings.bunq_environment.upper() != "SANDBOX" and not settings.bunq_live_write:
+        log.info("Skipping bunq write for receipt #%s (live writes disabled).", receipt.id)
+        return None
+
+    description = f"{receipt.merchant_name or 'Receipt'} #{receipt.id}"
+    try:
+        client = get_bunq_client()
+        # Make sure the account has funds for this payment.
+        if client.get_main_balance_eur() < (receipt.total_amount or 0) + 1:
+            try:
+                client.request_funds_from_sugardaddy(500.0)
+            except BunqSandboxError as exc:
+                log.warning("Sandbox top-up before receipt payment failed: %s", exc)
+
+        result = client.send_payment_to_email(
+            amount_eur=float(receipt.total_amount or 0),
+            counterparty_email="sugardaddy@bunq.com",
+            description=description,
+        )
+    except BunqSandboxError as exc:
+        log.warning("bunq write for receipt #%s failed: %s", receipt.id, exc)
+        return None
+
+    payment_id = str(result.get("id") or "")
+    if not payment_id:
+        log.warning("bunq payment for receipt #%s returned no id", receipt.id)
+        return None
+
+    is_food, confidence, category = classify_merchant(
+        receipt.merchant_name or "", description
+    )
+    transaction = Transaction(
+        bunq_payment_id=payment_id,
+        merchant_name=receipt.merchant_name or "Receipt",
+        description=description,
+        amount=-float(receipt.total_amount or 0),
+        currency=receipt.currency or "EUR",
+        payment_date=receipt.purchase_date or utc_now(),
+        direction=TransactionDirection.OUTGOING,
+        is_food_candidate=is_food,
+        food_confidence=max(confidence, 0.85),
+        merchant_category=category if category != MerchantCategory.UNKNOWN else MerchantCategory.SUPERMARKET,
+    )
+    session.add(transaction)
+    session.commit()
+    session.refresh(transaction)
+    return transaction
 
 
 def best_transaction_match(session: Session, receipt: Receipt) -> Transaction | None:

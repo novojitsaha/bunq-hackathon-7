@@ -515,8 +515,89 @@ class BunqClient:
         return [item.get("Payment", {}) for item in items if "Payment" in item]
 
     # ------------------------------------------------------------------
-    # Write endpoint (gated by BUNQ_LIVE_WRITE)
+    # Write endpoints
+    #
+    # In SANDBOX environment we always allow writes (it's fake money).
+    # In PRODUCTION we still gate behind BUNQ_LIVE_WRITE for safety.
     # ------------------------------------------------------------------
+
+    def _writes_allowed(self) -> bool:
+        if self.settings.bunq_environment.upper() == "SANDBOX":
+            return True
+        return bool(self.settings.bunq_live_write)
+
+    def _pick_main_account(self) -> dict[str, Any]:
+        accounts = self.list_monetary_accounts()
+        if not accounts:
+            raise BunqSandboxError("No monetary accounts available on this user.")
+        return next((a for a in accounts if a["_kind"] == "MonetaryAccountBank"), accounts[0])
+
+    def get_main_balance_eur(self) -> float:
+        """Float balance of the user's main account, in EUR."""
+        try:
+            main = self._pick_main_account()
+            return float((main.get("balance") or {}).get("value", "0"))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def request_funds_from_sugardaddy(self, amount_eur: float) -> dict[str, Any]:
+        """
+        Sandbox-only: ask sugardaddy@bunq.com for money. Sugardaddy is bunq's
+        sandbox auto-accepter for amounts up to €500. The funds appear in our
+        account within a second or two. We use this to keep the demo account
+        funded when balance gets low.
+        """
+        if self.settings.bunq_environment.upper() != "SANDBOX":
+            raise BunqSandboxError("request_funds_from_sugardaddy is sandbox-only")
+        if amount_eur <= 0 or amount_eur > 500:
+            raise BunqSandboxError("amount must be in (0, 500]")
+        ctx = self.ensure_context()
+        main = self._pick_main_account()
+        items = self._request(
+            "POST",
+            f"/v1/user/{ctx.user_id}/monetary-account/{main['id']}/request-inquiry",
+            body={
+                "amount_inquired": {"value": f"{amount_eur:.2f}", "currency": "EUR"},
+                "counterparty_alias": {"type": "EMAIL", "value": "sugardaddy@bunq.com"},
+                "description": "BunqBiteBalance demo top-up",
+                "allow_bunqme": False,
+            },
+        )
+        return next((it["Id"] for it in items if "Id" in it), {})
+
+    def send_payment_to_email(
+        self,
+        *,
+        amount_eur: float,
+        counterparty_email: str,
+        description: str,
+    ) -> dict[str, Any]:
+        """
+        Send a Payment to a counterparty by email. Used to record a receipt
+        as a real bunq sandbox transaction so the user can see "I scanned a
+        receipt → bunq shows the payment".
+
+        The counterparty doesn't need to be a friend; in sandbox we send to
+        `sugardaddy@bunq.com` because it's always available.
+        """
+        if not self._writes_allowed():
+            raise BunqSandboxError(
+                "BUNQ_LIVE_WRITE is false (and we're not in sandbox) — payment was not sent."
+            )
+        ctx = self.ensure_context()
+        main = self._pick_main_account()
+        # Truncate description to bunq's 140-char limit.
+        desc = (description or "")[:140]
+        items = self._request(
+            "POST",
+            f"/v1/user/{ctx.user_id}/monetary-account/{main['id']}/payment",
+            body={
+                "amount": {"value": f"{amount_eur:.2f}", "currency": "EUR"},
+                "counterparty_alias": {"type": "EMAIL", "value": counterparty_email},
+                "description": desc,
+            },
+        )
+        return next((it["Id"] for it in items if "Id" in it), {})
 
     def create_payment(
         self,
@@ -527,7 +608,8 @@ class BunqClient:
         counterparty_name: str,
         description: str,
     ) -> dict[str, Any]:
-        if not self.settings.bunq_live_write:
+        """IBAN-based payment write. Kept for completeness; the demo uses EMAIL."""
+        if not self._writes_allowed():
             raise BunqSandboxError(
                 "BUNQ_LIVE_WRITE is false — payment was not sent. Enable in .env "
                 "to allow real sandbox payments."

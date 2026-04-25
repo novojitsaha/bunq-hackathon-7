@@ -45,6 +45,19 @@ def sync_transactions(session: Session, settings: Settings | None = None) -> tup
 
         # Use the first non-savings account as the "main" account.
         main = next((a for a in accounts if a["_kind"] == "MonetaryAccountBank"), accounts[0])
+
+        # Sandbox-only: keep the account funded so demo payments succeed.
+        # bunq sandbox starts new accounts at 0 EUR; sugardaddy auto-accepts up to €500.
+        balance = float((main.get("balance") or {}).get("value", "0"))
+        topped_up_msg = ""
+        if settings.bunq_environment.upper() == "SANDBOX" and balance < 100:
+            try:
+                client.request_funds_from_sugardaddy(500.0)
+                topped_up_msg = " (auto-topped-up €500 from sugardaddy)"
+                log.info("Sandbox account topped up with 500 EUR from sugardaddy.")
+            except BunqSandboxError as exc:
+                log.warning("sandbox top-up failed: %s — continuing", exc)
+
         payments = client.list_payments(int(main["id"]), limit=50)
     except BunqSandboxError as exc:
         log.warning("bunq sync failed: %s — seeding demo data", exc)
@@ -62,7 +75,9 @@ def sync_transactions(session: Session, settings: Settings | None = None) -> tup
     ctx = client._ctx
     if ctx and ctx.minted_key:
         minted_msg = " (auto-minted a fresh sandbox user because the configured key had expired)"
-    return "live", created, f"Pulled {len(payments)} payments from bunq sandbox; {created} new.{minted_msg}"
+    return "live", created, (
+        f"Pulled {len(payments)} payments from bunq sandbox; {created} new.{minted_msg}{topped_up_msg}"
+    )
 
 
 def seed_demo_transactions(session: Session) -> int:
