@@ -8,6 +8,9 @@ Hackathon MVP for linking bunq food payments with receipt-level multimodal extra
 - React/Vite frontend with dashboard, scan/upload, receipt review, instant summary, monthly summary, goals, transactions, and settings pages.
 - Offline demo mode by default. Upload filenames containing `junk`, `ah`, or `albert` use the Albert Heijn fixture; filenames containing `fast`, `burger`, or `king` use the fast-food fixture; other names use the Lidl healthy fixture.
 
+<img width="716" height="888" alt="Screenshot 2026-04-25 140801" src="https://github.com/user-attachments/assets/18e85864-a05d-4ae4-959d-91a87784fac3" />
+
+
 ## Start Backend
 
 ```powershell
