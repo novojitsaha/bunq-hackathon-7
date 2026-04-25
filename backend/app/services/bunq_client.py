@@ -70,12 +70,18 @@ class BunqContext:
     user_id: int
     user_type: str  # "UserPerson" | "UserCompany" | "UserApiKey"
     session_expiry_ts: float
+    # If we auto-minted a fresh sandbox user, the new key is recorded here
+    # so the user can see in .bunq_context.json what's actually being used.
+    minted_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "BunqContext":
+        # Tolerate older context files that don't have minted_key.
+        d = {**d}
+        d.setdefault("minted_key", None)
         return cls(**d)
 
 
@@ -123,6 +129,60 @@ def _sign_body(private_pem: str, body: bytes) -> str:
     return base64.standard_b64encode(sig).decode("ascii")
 
 
+def _looks_like_credential_error(exc: Exception) -> bool:
+    """
+    True if a BunqSandboxError looks like the well-documented expiry/IP failure:
+
+      "User credentials are incorrect. Incorrect API key or IP address."
+
+    Sandbox keys expire if no session is opened within 60 minutes of creation
+    and become bound to the IP they were first used from. When we see this,
+    minting a fresh sandbox user is the right recovery.
+    """
+    msg = str(exc).lower()
+    needles = (
+        "user credentials are incorrect",
+        "incorrect api key",
+        "incorrect api key or ip",
+        "key is invalid",
+        "expired",
+    )
+    return any(n in msg for n in needles)
+
+
+def _extract_api_key_from_sandbox_response(payload: Any) -> str | None:
+    """
+    bunq's sandbox-user endpoints have used a few response shapes over the
+    years. We accept any of them:
+
+      Newer wrapped:
+        {"Response": [{"ApiKey": {"api_key": "sandbox_..."}}, ...]}
+      Older wrapped (UserPerson with embedded api_key):
+        {"Response": [{"UserPerson": {"id": ..., "api_key": "sandbox_..."}}]}
+      Flat (legacy /v1/sandbox-user):
+        {"api_key": "sandbox_...", "user": {...}}
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    # Flat: {"api_key": "..."}
+    if isinstance(payload.get("api_key"), str):
+        return payload["api_key"]
+
+    # Wrapped: {"Response": [...]}
+    items = payload.get("Response")
+    if not isinstance(items, list):
+        return None
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for value in item.values():
+            if isinstance(value, dict) and isinstance(value.get("api_key"), str):
+                return value["api_key"]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -151,6 +211,13 @@ class BunqClient:
     # ------------------------------------------------------------------
 
     def available(self) -> bool:
+        """
+        True if we can do bunq calls. In sandbox mode this is always true
+        because we can auto-mint a user. In production it requires a real
+        API key.
+        """
+        if self.settings.bunq_environment.upper() == "SANDBOX":
+            return True
         return bool(self.settings.bunq_api_key)
 
     def base_url(self) -> str:
@@ -162,16 +229,26 @@ class BunqClient:
     def ensure_context(self) -> BunqContext:
         """
         Returns a valid context, bootstrapping or refreshing as needed.
-        Raises BunqSandboxError on any failure.
+
+        Self-healing logic for the sandbox:
+          1. If we have a cached context with a valid session, use it.
+          2. If we have installation+device but the session expired, refresh.
+          3. If bootstrap fails because the API key is expired/invalid (the
+             "User credentials are incorrect" error), automatically mint a
+             fresh sandbox user via /v1/sandbox-user-person and retry.
+
+        bunq sandbox keys expire if no session is opened within 60 minutes
+        of creation, so for a hackathon demo this auto-mint behaviour is the
+        difference between "it just works" and "manually re-running Tinker
+        between every demo take."
+
+        Raises BunqSandboxError on any failure that we couldn't recover from.
         """
         if self._ctx is None:
             self._ctx = _load_context(self._ctx_path())
 
         if self._ctx and self._ctx.session_expiry_ts > time.time() + 60:
             return self._ctx
-
-        if not self.settings.bunq_api_key:
-            raise BunqSandboxError("BUNQ_API_KEY not configured")
 
         # If we have an installation+device but the session expired, refresh just the session.
         if self._ctx and self._ctx.installation_token and self._ctx.device_id:
@@ -182,11 +259,85 @@ class BunqClient:
             except Exception as exc:  # noqa: BLE001
                 log.warning("bunq session refresh failed (%s) — re-bootstrapping", exc)
 
-        self._ctx = self._bootstrap()
+        # Try the bootstrap with the configured key. If it fails with a
+        # credential error (or there's no key at all) we auto-mint a fresh
+        # sandbox user and retry.
+        api_key = self.settings.bunq_api_key
+        if not api_key:
+            log.info("No BUNQ_API_KEY configured — minting fresh sandbox user.")
+            new_key = self._mint_sandbox_user()
+            self.settings.bunq_api_key = new_key
+            self._ctx = self._bootstrap(new_key)
+            self._ctx.minted_key = new_key
+            _save_context(self._ctx_path(), self._ctx)
+            return self._ctx
+
+        try:
+            self._ctx = self._bootstrap(api_key)
+        except BunqSandboxError as exc:
+            if not _looks_like_credential_error(exc):
+                raise
+            log.warning(
+                "bunq bootstrap failed with credential error (%s). "
+                "Minting fresh sandbox user and retrying.",
+                exc,
+            )
+            new_key = self._mint_sandbox_user()
+            log.info("Minted fresh sandbox API key; updating runtime settings.")
+            # Update both the runtime settings and the cached value so subsequent
+            # calls in this process use the new key.
+            self.settings.bunq_api_key = new_key
+            self._ctx = self._bootstrap(new_key)
+            # Persist the new key alongside the context so the user can see it.
+            self._ctx.minted_key = new_key
+
         _save_context(self._ctx_path(), self._ctx)
         return self._ctx
 
-    def _bootstrap(self) -> BunqContext:
+    def _mint_sandbox_user(self) -> str:
+        """
+        POST /v1/sandbox-user-person — creates a fresh sandbox user and returns
+        its API key. Unauthenticated endpoint, no signing required.
+
+        bunq has rotated this endpoint a few times over the years; we accept
+        all known response shapes (Response[ApiKey], Response[UserPerson], or
+        a flat {"api_key": ...} object) defensively.
+        """
+        base = self.base_url()
+        # Endpoints to try in order. The first that returns 200 wins.
+        endpoints = [
+            "/v1/sandbox-user-person",
+            "/v1/sandbox-user-company",
+            "/v1/sandbox-user",  # legacy
+        ]
+        last_error = ""
+        for path in endpoints:
+            try:
+                r = self._http.post(
+                    f"{base}{path}",
+                    json={},
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "User-Agent": "BunqBiteBalance-Hackathon/0.2",
+                        "X-Bunq-Client-Request-Id": str(uuid.uuid4()),
+                        "X-Bunq-Geolocation": "0 0 0 0 NL",
+                        "X-Bunq-Language": "en_US",
+                        "X-Bunq-Region": "nl_NL",
+                    },
+                )
+            except httpx.RequestError as exc:
+                last_error = f"{path}: network error {exc}"
+                continue
+            if r.status_code != 200:
+                last_error = f"{path}: {r.status_code} {r.text[:200]}"
+                continue
+            key = _extract_api_key_from_sandbox_response(r.json())
+            if key:
+                return key
+            last_error = f"{path}: 200 but no api_key in response: {r.text[:200]}"
+        raise BunqSandboxError(f"could not mint a fresh sandbox user. Last error: {last_error}")
+
+    def _bootstrap(self, api_key: str) -> BunqContext:
         priv, pub = _generate_keypair()
         base = self.base_url()
 
@@ -207,11 +358,12 @@ class BunqClient:
             item["ServerPublicKey"]["server_public_key"] for item in inst if "ServerPublicKey" in item
         )
 
-        # Step 2: device-server
+        # Step 2: device-server. permitted_ips=["*"] makes this a wildcard key
+        # so subsequent sessions work from any IP — important for demos.
         body = json.dumps({
             "description": "BunqBiteBalance Hackathon Device",
-            "secret": self.settings.bunq_api_key,
-            "permitted_ips": ["*"],  # sandbox only — production would lock to specific IPs
+            "secret": api_key,
+            "permitted_ips": ["*"],
         }).encode("utf-8")
         r = self._http.post(
             f"{base}/v1/device-server",
@@ -228,7 +380,7 @@ class BunqClient:
         device_id = next(item["Id"]["id"] for item in self._unwrap(r.json()) if "Id" in item)
 
         # Step 3: session-server
-        return self._open_session(priv, server_pub, token, device_id, base)
+        return self._open_session(priv, server_pub, token, device_id, base, api_key)
 
     def _refresh_session(self, ctx: BunqContext) -> BunqContext:
         return self._open_session(
@@ -237,6 +389,7 @@ class BunqClient:
             ctx.installation_token,
             ctx.device_id,
             ctx.base_url,
+            self.settings.bunq_api_key or "",
         )
 
     def _open_session(
@@ -246,8 +399,9 @@ class BunqClient:
         installation_token: str,
         device_id: int,
         base: str,
+        api_key: str,
     ) -> BunqContext:
-        body = json.dumps({"secret": self.settings.bunq_api_key}).encode("utf-8")
+        body = json.dumps({"secret": api_key}).encode("utf-8")
         r = self._http.post(
             f"{base}/v1/session-server",
             content=body,
@@ -304,6 +458,7 @@ class BunqClient:
         path: str,
         *,
         body: dict[str, Any] | None = None,
+        _retry: bool = True,
     ) -> list[dict[str, Any]]:
         ctx = self.ensure_context()
         body_bytes = json.dumps(body).encode("utf-8") if body is not None else b""
@@ -318,6 +473,20 @@ class BunqClient:
 
         url = ctx.base_url + path
         r = self._http.request(method, url, headers=headers, content=body_bytes or None)
+        if r.status_code in (401, 403) and _retry:
+            # Stale cached context — clear it and re-bootstrap (which may
+            # also auto-mint if the underlying key has expired). One retry,
+            # to avoid infinite loops.
+            log.warning(
+                "bunq returned %s on %s — invalidating cached context and retrying once",
+                r.status_code, path,
+            )
+            self._ctx = None
+            try:
+                self._ctx_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+            return self._request(method, path, body=body, _retry=False)
         if r.status_code >= 400:
             raise BunqSandboxError(f"{method} {path} -> {r.status_code} {r.text[:300]}")
         return self._unwrap(r.json())

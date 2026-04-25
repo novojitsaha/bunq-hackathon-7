@@ -33,7 +33,12 @@ _HACKATHON_ANTHROPIC_KEY = (
     "QDPvocZdn5M0rrF4LUaDeIWaUuCC04bVDGI7Pw-poKZ4gAA"
 )
 
-_HACKATHON_BUNQ_SANDBOX_KEY = "sandbox_18f2f43f37f40c04ebb1e85a44d862aa2865a0b62e2afb5bb92b60c2"
+# NOTE: We deliberately ship NO bunq key in source. The bunq sandbox key the
+# user generated at 2026-04-25 08:58 expired ~60 minutes after creation (per
+# bunq's documented sandbox behaviour), so hardcoding it would be a footgun.
+# Instead, the BunqClient auto-mints a fresh sandbox user on first call. See
+# app/services/bunq_client.py:_mint_sandbox_user().
+_HACKATHON_BUNQ_SANDBOX_KEY = None
 
 
 def _find_env_file() -> str:

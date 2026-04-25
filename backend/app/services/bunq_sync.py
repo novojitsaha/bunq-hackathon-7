@@ -32,8 +32,9 @@ log = logging.getLogger(__name__)
 def sync_transactions(session: Session, settings: Settings | None = None) -> tuple[str, int, str]:
     settings = settings or get_settings()
     if not settings.bunq_api_key:
-        created = seed_demo_transactions(session)
-        return "demo", created, "No BUNQ_API_KEY configured; seeded demo transactions."
+        # Try to mint a fresh sandbox user even with no key configured —
+        # the BunqClient will handle this via _mint_sandbox_user().
+        log.info("No BUNQ_API_KEY configured; attempting to auto-mint a sandbox user.")
 
     try:
         client = get_bunq_client()
@@ -55,7 +56,13 @@ def sync_transactions(session: Session, settings: Settings | None = None) -> tup
         if _upsert_payment(session, payment):
             created += 1
     session.commit()
-    return "live", created, f"Pulled {len(payments)} payments from bunq sandbox; {created} new."
+
+    # Surface auto-mint event in the message so the user sees it on the dashboard.
+    minted_msg = ""
+    ctx = client._ctx
+    if ctx and ctx.minted_key:
+        minted_msg = " (auto-minted a fresh sandbox user because the configured key had expired)"
+    return "live", created, f"Pulled {len(payments)} payments from bunq sandbox; {created} new.{minted_msg}"
 
 
 def seed_demo_transactions(session: Session) -> int:

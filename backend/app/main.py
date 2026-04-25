@@ -33,10 +33,13 @@ def on_startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
+    bunq_status = "yes" if settings.bunq_api_key else (
+        "auto-mint" if settings.bunq_environment.upper() == "SANDBOX" else "no"
+    )
     return {
         "status": "ok",
         "anthropic_configured": "yes" if settings.anthropic_api_key else "no",
-        "bunq_configured": "yes" if settings.bunq_api_key else "no",
+        "bunq_configured": bunq_status,
     }
 
 
