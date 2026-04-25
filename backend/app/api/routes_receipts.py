@@ -1,12 +1,18 @@
-from fastapi import APIRouter, Depends, UploadFile
+from fastapi import APIRouter, Body, Depends, UploadFile
 from sqlmodel import Session, select
 
 from app.api.deps import get_item_or_404, get_receipt_or_404, receipt_with_items, transaction_for_receipt
 from app.db import get_session
 from app.models import ReceiptItem, utc_now
 from app.schemas import ReceiptItemRead, ReceiptItemUpdate, ReceiptRead, ReceiptSummary, TransactionRead
+from app.services.ai_receipt_extractor import ReceiptExtractor
 from app.services.metrics import receipt_splits
-from app.services.receipt_processing import confirm_receipt, create_receipt_from_upload
+from app.services.receipt_processing import (
+    apply_extraction,
+    confirm_receipt,
+    create_receipt_from_upload,
+)
+from app.models import Receipt, ReceiptStatus
 
 router = APIRouter(prefix="/api/receipts", tags=["receipts"])
 
@@ -17,6 +23,41 @@ async def upload_receipt(file: UploadFile, session: Session = Depends(get_sessio
     receipt = await create_receipt_from_upload(
         session, filename=file.filename, content_type=file.content_type, content=content
     )
+    return receipt_with_items(session, receipt)
+
+
+@router.post("/voice", response_model=ReceiptRead)
+async def upload_receipt_via_voice(
+    payload: dict = Body(...),
+    session: Session = Depends(get_session),
+):
+    """
+    Voice modality entry point.
+
+    The frontend uses the browser's Web Speech API to transcribe what the
+    user says ("I just bought a flat white at Bocca for 4.50") and POSTs
+    the transcript here. Claude turns it into the same structured receipt
+    shape as a scanned image, and the rest of the review/confirm flow is
+    identical.
+    """
+    transcript = (payload.get("transcript") or "").strip()
+    if not transcript:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="transcript is required")
+
+    extractor = ReceiptExtractor()
+    extracted, raw = await extractor.extract_from_voice(transcript)
+
+    receipt = Receipt(
+        upload_filename=f"voice:{transcript[:60]}",
+        file_type="text/voice-transcript",
+        status=ReceiptStatus.PROCESSING,
+    )
+    session.add(receipt)
+    session.commit()
+    session.refresh(receipt)
+
+    await apply_extraction(session, receipt, extracted, raw)
     return receipt_with_items(session, receipt)
 
 
